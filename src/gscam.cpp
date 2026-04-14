@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <algorithm>
 #include <iostream>
 #include <string>
 
@@ -62,7 +63,9 @@ GSCam::GSCam(const rclcpp::NodeOptions & options)
 GSCam::~GSCam()
 {
   stop_signal_ = true;
-  pipeline_thread_.join();
+  if (pipeline_thread_.joinable()) {
+    pipeline_thread_.join();
+  }
 }
 
 bool GSCam::configure()
@@ -258,7 +261,9 @@ bool GSCam::init_stream()
   }
 
   // Create ROS camera interface
-  const auto qos = use_sensor_data_qos_ ? rclcpp::SensorDataQoS() : rclcpp::QoS{1};
+  // const auto qos = use_sensor_data_qos_ ? rclcpp::SensorDataQoS() : rclcpp::QoS{1};
+  const auto qos = rclcpp::QoS{100};
+
   if (image_encoding_ == "jpeg") {
     jpeg_pub_ =
       create_publisher<sensor_msgs::msg::CompressedImage>(
@@ -318,13 +323,23 @@ void GSCam::update_stream()
       RCLCPP_ERROR(get_logger(), "Could not get gstreamer sample.");
       break;
     }
-    GstBuffer * buf = gst_sample_get_buffer(sample);
-    GstMemory * memory = gst_buffer_get_memory(buf, 0);
-    GstMapInfo info;
 
-    gst_memory_map(memory, &info, GST_MAP_READ);
-    gsize & buf_size = info.size;
-    guint8 * & buf_data = info.data;
+    GstBuffer * buf = gst_sample_get_buffer(sample);
+    if (!buf) {
+      RCLCPP_INFO(get_logger(), "Stream ended.");
+      gst_sample_unref(sample);
+      break;
+    }
+
+    GstMapInfo info;
+    if (!gst_buffer_map(buf, &info, GST_MAP_READ)) {
+      RCLCPP_ERROR(get_logger(), "Could not map gstreamer buffer.");
+      gst_sample_unref(sample);
+      continue;
+    }
+
+    const gsize buf_size = info.size;
+    const guint8 * buf_data = info.data;
 
     GstClockTime bt = gst_element_get_base_time(pipeline_);
     // RCLCPP_INFO(
@@ -344,22 +359,37 @@ void GSCam::update_stream()
     }
 #endif
 
-    // Stop on end of stream
-    if (!buf) {
-      RCLCPP_INFO(get_logger(), "Stream ended.");
-      break;
-    }
-
     // RCLCPP_DEBUG(get_logger(), "Got data.");
 
     // Get the image width and height
     GstPad * pad = gst_element_get_static_pad(sink_, "sink");
     const GstCaps * caps = gst_pad_get_current_caps(pad);
+    if (!caps) {
+      RCLCPP_ERROR(get_logger(), "Could not get current caps from sink pad.");
+      gst_object_unref(pad);
+      gst_buffer_unmap(buf, &info);
+      gst_sample_unref(sample);
+      continue;
+    }
+
     GstStructure * structure = gst_caps_get_structure(caps, 0);
+    if (!structure) {
+      RCLCPP_ERROR(get_logger(), "Could not get caps structure.");
+      gst_caps_unref(const_cast<GstCaps *>(caps));
+      gst_object_unref(pad);
+      gst_buffer_unmap(buf, &info);
+      gst_sample_unref(sample);
+      continue;
+    }
+
     gst_structure_get_int(structure, "width", &width_);
     gst_structure_get_int(structure, "height", &height_);
+    gst_caps_unref(const_cast<GstCaps *>(caps));
+    gst_object_unref(pad);
 
-    // Update header information
+    // Update message payload under lock as publish_stream() runs concurrently.
+    std::lock_guard<std::mutex> lock(message_mutex_);
+
     cinfo_msg_ = camera_info_manager_.getCameraInfo();
 
     if (use_gst_timestamps_) {
@@ -373,9 +403,7 @@ void GSCam::update_stream()
       comp_img_msg_.header = cinfo_msg_.header;
       comp_img_msg_.format = "jpeg";
       comp_img_msg_.data.resize(buf_size);
-      std::copy(
-        buf_data, (buf_data) + (buf_size),
-        comp_img_msg_.data.begin());
+      std::copy_n(buf_data, buf_size, comp_img_msg_.data.begin());
     } else {
       // Complain if the returned buffer is smaller than we expect
       const unsigned int expected_frame_size =
@@ -386,6 +414,11 @@ void GSCam::update_stream()
           get_logger(), "GStreamer image buffer underflow: Expected frame to be " <<
             expected_frame_size << " bytes but got only " <<
             buf_size << " bytes. (make sure frames are correctly encoded)");
+      } else if (buf_size > expected_frame_size) {
+        RCLCPP_WARN_STREAM(
+          get_logger(), "GStreamer image buffer overflow: Expected frame to be " <<
+            expected_frame_size << " bytes but got " <<
+            buf_size << " bytes. Truncating extra bytes.");
       }
 
       img_msg_.header = cinfo_msg_.header;
@@ -401,40 +434,47 @@ void GSCam::update_stream()
       // Since we're publishing shared pointers, we need to copy the image so
       // we can free the buffer allocated by gstreamer
       img_msg_.step = width_ * sensor_msgs::image_encodings::numChannels(image_encoding_);
+      const auto bytes_to_copy = std::min(static_cast<size_t>(buf_size),
+        static_cast<size_t>(expected_frame_size));
 
-      std::copy(
-        buf_data,
-        (buf_data) + (buf_size),
-        img_msg_.data.begin());
+      std::copy_n(buf_data, bytes_to_copy, img_msg_.data.begin());
     }
 
     // Release the buffer
-    if (buf) {
-      gst_memory_unmap(memory, &info);
-      gst_memory_unref(memory);
-      gst_sample_unref(sample);
-    }
+    gst_buffer_unmap(buf, &info);
+    gst_sample_unref(sample);
   }
 }
 
 void GSCam::publish_stream()
 {
+  sensor_msgs::msg::Image img_msg;
+  sensor_msgs::msg::CompressedImage comp_img_msg;
+  sensor_msgs::msg::CameraInfo cinfo_msg;
+
+  {
+    std::lock_guard<std::mutex> lock(message_mutex_);
+    img_msg = img_msg_;
+    comp_img_msg = comp_img_msg_;
+    cinfo_msg = cinfo_msg_;
+  }
+
   if (image_encoding_ == "jpeg") {
-    jpeg_pub_->publish(comp_img_msg_);
-    cinfo_pub_->publish(cinfo_msg_);
+    jpeg_pub_->publish(comp_img_msg);
+    cinfo_pub_->publish(cinfo_msg);
   } else {
     // Publish the image/info
-    camera_pub_.publish(img_msg_, cinfo_msg_);
+    camera_pub_.publish(img_msg, cinfo_msg);
   }
   if (enable_rectifying_) {
     sensor_msgs::msg::Image img_rect_msg;
     try {
       cv_bridge::CvImage img_bridge_rect =
-        cv_bridge::CvImage(img_msg_.header, sensor_msgs::image_encodings::RGB8);
+        cv_bridge::CvImage(img_msg.header, sensor_msgs::image_encodings::RGB8);
       (void)img_bridge_rect;
 
-      cv_bridge::CvImagePtr cv_img_raw = cv_bridge::toCvCopy(img_msg_, img_msg_.encoding);
-      pinhole_model_.fromCameraInfo(cinfo_msg_);
+      cv_bridge::CvImagePtr cv_img_raw = cv_bridge::toCvCopy(img_msg, img_msg.encoding);
+      pinhole_model_.fromCameraInfo(cinfo_msg);
       pinhole_model_.rectifyImage(cv_img_raw->image, img_bridge_rect.image);
 
       img_bridge_rect.toImageMsg(img_rect_msg);

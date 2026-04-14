@@ -80,6 +80,11 @@ install(TARGETS gscam
 )
 
 install(
-  DIRECTORY examples config
+  DIRECTORY launch config
   DESTINATION "share/${PROJECT_NAME}"
 )
+
+#ament_auto_package(INSTALL_TO_SHARE
+#  launch
+#  config
+#)

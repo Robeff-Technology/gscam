@@ -17,6 +17,7 @@
 
 #include <stdexcept>
 #include <string>
+#include <mutex>
 
 extern "C" {
 #include "gst/gst.h"
@@ -105,6 +106,9 @@ private:
   // Poll gstreamer on a separate thread
   std::thread pipeline_thread_;
   std::atomic<bool> stop_signal_;
+
+  // Protect shared messages exchanged across threads
+  std::mutex message_mutex_;
 };
 
 }  // namespace gscam

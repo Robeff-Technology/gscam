@@ -25,7 +25,6 @@ extern "C" {
 #include "gst/app/gstappsink.h"
 }
 
-#include "image_transport/image_transport.hpp"
 #include "camera_info_manager/camera_info_manager.hpp"
 #include "cv_bridge/cv_bridge.h"
 
@@ -271,11 +270,14 @@ bool GSCam::init_stream()
     cinfo_pub_ = create_publisher<sensor_msgs::msg::CameraInfo>(
       "camera_info", qos);
   } else {
-    camera_pub_ = image_transport::create_camera_publisher(
-      this, "image_raw", qos.get_rmw_qos_profile());
+    // Use regular publishers instead of image_transport to avoid compressed variants
+    image_pub_ = create_publisher<sensor_msgs::msg::Image>(
+      "image_raw", qos);
+    cinfo_pub_ = create_publisher<sensor_msgs::msg::CameraInfo>(
+      "camera_info", qos);
   }
   camera_pub_rect_ = create_publisher<sensor_msgs::msg::Image>(
-    "image_rect",qos);
+    "image_rect", qos);
 
   return true;
 }
@@ -463,8 +465,9 @@ void GSCam::publish_stream()
     jpeg_pub_->publish(comp_img_msg);
     cinfo_pub_->publish(cinfo_msg);
   } else {
-    // Publish the image/info
-    camera_pub_.publish(img_msg, cinfo_msg);
+    // Publish raw image and camera info
+    image_pub_->publish(img_msg);
+    cinfo_pub_->publish(cinfo_msg);
   }
   if (enable_rectifying_) {
     sensor_msgs::msg::Image img_rect_msg;

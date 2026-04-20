@@ -27,8 +27,6 @@ extern "C" {
 #include "rclcpp/rclcpp.hpp"
 #include "image_geometry/pinhole_camera_model.h"
 
-
-#include "image_transport/image_transport.hpp"
 #include "camera_info_manager/camera_info_manager.hpp"
 
 #include "sensor_msgs/msg/image.hpp"
@@ -84,7 +82,6 @@ private:
   // Calibration between ros::Time and gst timestamps
   uint64_t time_offset_;
   camera_info_manager::CameraInfoManager camera_info_manager_;
-  image_transport::CameraPublisher camera_pub_;
 
   // ROS Timer
   rclcpp::TimerBase::SharedPtr timer_;
@@ -96,7 +93,8 @@ private:
   // Camera Info message
   sensor_msgs::msg::CameraInfo cinfo_msg_;
 
-  // Case of a jpeg only publisher
+  // Camera publishers
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_;
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr jpeg_pub_;
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr cinfo_pub_;
 

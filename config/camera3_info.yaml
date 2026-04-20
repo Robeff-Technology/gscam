@@ -1,6 +1,7 @@
+# camera71
 image_width: 1920
 image_height: 1536
-camera_name: camera71
+camera_name: camera3
 camera_matrix:
   rows: 3
   cols: 3

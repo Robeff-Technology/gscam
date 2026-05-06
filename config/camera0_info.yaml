@@ -1,0 +1,27 @@
+# camera51
+image_width: 1920
+image_height: 1536
+camera_name: camera0
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [1995.46433,    0.     ,  915.45021,
+            0.     , 1997.36795,  794.05839,
+            0.     ,    0.     ,    1.     ]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [-0.562008, 0.303193, -0.003601, 0.001459, 0.000000]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1., 0., 0.,
+         0., 1., 0.,
+         0., 0., 1.]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [1995.46433,    0.     ,  915.45021,    0.     ,
+            0.     , 1997.36795,  794.05839,    0.     ,
+            0.     ,    0.     ,    1.     ,    0.     ]  

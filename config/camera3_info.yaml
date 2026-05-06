@@ -1,18 +1,18 @@
-# camera71
+# camera08
 image_width: 1920
 image_height: 1536
 camera_name: camera3
 camera_matrix:
   rows: 3
   cols: 3
-  data: [983.9381 ,   0.     , 946.37673,
-           0.     , 991.62234, 755.25681,
+  data: [980.64685,   0.     , 956.51558,
+           0.     , 987.3307 , 776.95868,
            0.     ,   0.     ,   1.     ]
 distortion_model: plumb_bob
 distortion_coefficients:
   rows: 1
   cols: 5
-  data: [-0.275134, 0.052305, 0.000577, 0.000410, 0.000000]
+  data: [-0.269953, 0.046971, -0.001743, 0.001197, 0.000000]
 rectification_matrix:
   rows: 3
   cols: 3
@@ -22,6 +22,6 @@ rectification_matrix:
 projection_matrix:
   rows: 3
   cols: 4
-  data: [983.9381 ,   0.     , 946.37673,   0.     ,
-           0.     , 991.62234, 755.25681,   0.     ,
+  data: [980.64685,   0.     , 956.51558,   0.     ,
+           0.     , 987.3307 , 776.95868,   0.     ,
            0.     ,   0.     ,   1.     ,   0.     ]

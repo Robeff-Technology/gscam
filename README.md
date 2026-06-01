@@ -82,6 +82,13 @@ C++ API (unstable)
 
 The gscam c++ library can be used, but it is not guaranteed to be stable. 
 
+NPL54 card camera recognition problem solution
+-----------------
+
+1. Disabled secure boot in bios, BIOS->security->secure boot->disabled
+2. Remove pci-nomsi in /etc/default/grub (by sudo)
+
+
 Examples
 --------
 

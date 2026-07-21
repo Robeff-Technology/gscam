@@ -27,6 +27,7 @@ extern "C" {
 #include "image_transport/image_transport.hpp"
 #include "camera_info_manager/camera_info_manager.hpp"
 #include "cv_bridge/cv_bridge.h"
+#include "opencv2/imgproc.hpp"
 
 #include "sensor_msgs/msg/image.hpp"
 #include "sensor_msgs/msg/compressed_image.hpp"
@@ -115,6 +116,7 @@ bool GSCam::configure()
   image_encoding_ =
     declare_parameter("image_encoding", std::string(sensor_msgs::image_encodings::RGB8));
   if (image_encoding_ != sensor_msgs::image_encodings::RGB8 &&
+    image_encoding_ != sensor_msgs::image_encodings::BGR8 &&
     image_encoding_ != sensor_msgs::image_encodings::MONO8 &&
     image_encoding_ != sensor_msgs::image_encodings::YUV422 &&
     image_encoding_ != "jpeg")
@@ -175,6 +177,11 @@ bool GSCam::init_stream()
     caps = gst_caps_new_simple(
       "video/x-raw",
       "format", G_TYPE_STRING, "RGB",
+      NULL);
+  } else if (image_encoding_ == sensor_msgs::image_encodings::BGR8) {
+    caps = gst_caps_new_simple(
+      "video/x-raw",
+      "format", G_TYPE_STRING, "BGR",
       NULL);
   } else if (image_encoding_ == sensor_msgs::image_encodings::MONO8) {
     caps = gst_caps_new_simple(
@@ -429,13 +436,17 @@ void GSCam::publish_stream()
   if (enable_rectifying_) {
     sensor_msgs::msg::Image img_rect_msg;
     try {
+      // Match the rectified output encoding to the source encoding so that
+      // whatever `image_encoding` is configured (e.g. bgr8) propagates through
+      // to image_rect without an implicit channel-order mismatch.
       cv_bridge::CvImage img_bridge_rect =
-        cv_bridge::CvImage(img_msg_.header, sensor_msgs::image_encodings::RGB8);
-      (void)img_bridge_rect;
+        cv_bridge::CvImage(img_msg_.header, img_msg_.encoding);
 
       cv_bridge::CvImagePtr cv_img_raw = cv_bridge::toCvCopy(img_msg_, img_msg_.encoding);
       pinhole_model_.fromCameraInfo(cinfo_msg_);
-      pinhole_model_.rectifyImage(cv_img_raw->image, img_bridge_rect.image);
+      // INTER_NEAREST is cheaper than the default INTER_LINEAR and is adequate
+      // for a downstream detection network.
+      pinhole_model_.rectifyImage(cv_img_raw->image, img_bridge_rect.image, cv::INTER_NEAREST);
 
       img_bridge_rect.toImageMsg(img_rect_msg);
       camera_pub_rect_->publish(std::move(img_rect_msg));

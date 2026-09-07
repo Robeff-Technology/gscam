@@ -47,6 +47,10 @@ public:
 private:
   bool configure();
   bool init_stream();
+
+  // Offset to add to a GStreamer clock timestamp to express it in ROS time.
+  int64_t gst_to_ros_time_offset_ns();
+
   void update_stream();
   void publish_stream();
   void cleanup_stream();

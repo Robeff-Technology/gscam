@@ -150,6 +150,15 @@ bool GSCam::configure()
   return true;
 }
 
+int64_t GSCam::gst_to_ros_time_offset_ns()
+{
+  GstClock * clock = gst_system_clock_obtain();
+  const GstClockTime gst_now = gst_clock_get_time(clock);
+  gst_object_unref(clock);
+  return static_cast<int64_t>(now().nanoseconds()) -
+         static_cast<int64_t>(GST_TIME_AS_NSECONDS(gst_now));
+}
+
 bool GSCam::init_stream()
 {
   if (!gst_is_initialized()) {
@@ -248,11 +257,11 @@ bool GSCam::init_stream()
     }
   }
 
-  // Calibration between ros::Time and gst timestamps
-  GstClock * clock = gst_system_clock_obtain();
-  GstClockTime ct = gst_clock_get_time(clock);
-  gst_object_unref(clock);
-  time_offset_ = now().nanoseconds() - GST_TIME_AS_NSECONDS(ct);
+  // Calibration between ros::Time and gst timestamps. Kept as a reference value
+  // for logging only; the stamp of every frame re-reads this offset (see
+  // gst_to_ros_time_offset_ns) so that drift between the two clocks cannot
+  // accumulate into the published timestamps.
+  time_offset_ = gst_to_ros_time_offset_ns();
   RCLCPP_INFO(get_logger(), "Time offset: %.6f", rclcpp::Time(time_offset_).seconds());
 
   gst_element_set_state(pipeline_, GST_STATE_PAUSED);
@@ -370,7 +379,16 @@ void GSCam::update_stream()
     cinfo_msg_ = camera_info_manager_.getCameraInfo();
 
     if (use_gst_timestamps_) {
-      cinfo_msg_.header.stamp = rclcpp::Time(GST_TIME_AS_NSECONDS(buf->pts + bt) + time_offset_);
+      // GstSystemClock is CLOCK_MONOTONIC while now() reads the ROS clock, and the
+      // two do not advance at the same rate once the system clock is steered by
+      // NTP/PTP. Re-anchoring per frame keeps the precision of buf->pts (the v4l2
+      // dequeue instant) without inheriting the drift a startup-only offset would.
+      const int64_t frame_time_offset = gst_to_ros_time_offset_ns();
+      RCLCPP_DEBUG_THROTTLE(
+        get_logger(), *get_clock(), 10000, "Clock offset drift since startup: %.3f ms",
+        static_cast<double>(frame_time_offset - static_cast<int64_t>(time_offset_)) / 1e6);
+      cinfo_msg_.header.stamp = rclcpp::Time(
+        static_cast<int64_t>(GST_TIME_AS_NSECONDS(buf->pts + bt)) + frame_time_offset);
     } else {
       cinfo_msg_.header.stamp = now();
     }

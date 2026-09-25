@@ -15,8 +15,10 @@
 #ifndef GSCAM__GSCAM_HPP_
 #define GSCAM__GSCAM_HPP_
 
+#include <atomic>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 extern "C" {
 #include "gst/gst.h"
@@ -46,6 +48,7 @@ public:
 
 private:
   bool configure();
+  void init_publishers();
   bool init_stream();
 
   // Offset to add to a GStreamer clock timestamp to express it in ROS time.
@@ -79,6 +82,12 @@ private:
   bool use_sensor_data_qos_;
   int camera_frame_rate_;
   bool enable_rectifying_;
+  // Restart the pipeline when no frame arrives within this time (0 disables)
+  int frame_timeout_ms_;
+  // Delay before retrying a pipeline that failed to start or stalled
+  int reconnect_delay_ms_;
+  // Set by update_stream() when the stream reached EOS rather than stalling
+  bool stream_ended_ = false;
 
   // Camera model
   image_geometry::PinholeCameraModel pinhole_model_;
@@ -88,9 +97,6 @@ private:
   uint64_t time_offset_;
   camera_info_manager::CameraInfoManager camera_info_manager_;
   image_transport::CameraPublisher camera_pub_;
-
-  // ROS Timer
-  rclcpp::TimerBase::SharedPtr timer_;
 
   // Camera message
   sensor_msgs::msg::Image img_msg_;

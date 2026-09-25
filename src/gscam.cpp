@@ -16,6 +16,8 @@
 #include <unistd.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <string>
 
@@ -51,8 +53,10 @@ GSCam::GSCam(const rclcpp::NodeOptions & options)
     RCLCPP_FATAL(get_logger(), "Failed to configure gscam!");
     return;
   }
-  int period_ms = 1000 / camera_frame_rate_;
-  timer_ = this->create_wall_timer(std::chrono::milliseconds(period_ms), std::bind(&GSCam::publish_stream, this));
+  // Publishers must exist before the pipeline thread can deliver a frame.
+  // Frames are published from that thread as they arrive, so no timer is
+  // needed and publish never races with the frame being written.
+  init_publishers();
   pipeline_thread_ = std::thread(
     [this]()
     {
@@ -144,8 +148,12 @@ bool GSCam::configure()
   }
 
   use_sensor_data_qos_ = declare_parameter("use_sensor_data_qos", false);
+  // Unused since frames are published on arrival; kept so existing launch
+  // files that set it still load.
   camera_frame_rate_ = declare_parameter("camera_frame_rate", 15);
   enable_rectifying_ = declare_parameter("enable_rectifying", true);
+  frame_timeout_ms_ = declare_parameter("frame_timeout_ms", 2000);
+  reconnect_delay_ms_ = declare_parameter("reconnect_delay_ms", 1000);
 
   return true;
 }
@@ -228,6 +236,7 @@ bool GSCam::init_stream()
       RCLCPP_FATAL(get_logger(), "gst_bin_add() failed");
       gst_object_unref(outelement);
       gst_object_unref(pipeline_);
+      pipeline_ = NULL;
       return false;
     }
 
@@ -237,6 +246,7 @@ bool GSCam::init_stream()
         gst_element_get_name(outelement));
       gst_object_unref(outelement);
       gst_object_unref(pipeline_);
+      pipeline_ = NULL;
       return false;
     }
 
@@ -253,6 +263,7 @@ bool GSCam::init_stream()
     if (!gst_element_link(launchpipe, sink_)) {
       RCLCPP_FATAL(get_logger(), "GStreamer: cannot link launchpipe -> sink");
       gst_object_unref(pipeline_);
+      pipeline_ = NULL;
       return false;
     }
   }
@@ -273,6 +284,11 @@ bool GSCam::init_stream()
     RCLCPP_DEBUG_STREAM(get_logger(), "Stream is PAUSED.");
   }
 
+  return true;
+}
+
+void GSCam::init_publishers()
+{
   // Create ROS camera interface
   const auto qos = use_sensor_data_qos_ ? rclcpp::SensorDataQoS() : rclcpp::QoS{1};
   if (image_encoding_ == "jpeg") {
@@ -286,14 +302,13 @@ bool GSCam::init_stream()
       this, "image_raw", qos.get_rmw_qos_profile());
   }
   camera_pub_rect_ = create_publisher<sensor_msgs::msg::Image>(
-    "image_rect",qos);
-
-  return true;
+    "image_rect", qos);
 }
 
 void GSCam::update_stream()
 {
   RCLCPP_INFO_STREAM(get_logger(), "Publishing stream...");
+  stream_ended_ = false;
 
   // Pre-roll camera if needed
   if (preroll_) {
@@ -327,14 +342,31 @@ void GSCam::update_stream()
   // Poll the data as fast a spossible
   while (!stop_signal_ && rclcpp::ok()) {
     // This should block until a new frame is awake, this way, we'll run at the
-    // actual capture framerate of the device.
+    // actual capture framerate of the device. A v4l2 source can stop
+    // delivering frames without ever reaching EOS, so the wait is bounded and
+    // a stalled pipeline is handed back to run() to be reopened.
     // RCLCPP_DEBUG(get_logger(), "Getting data...");
-    GstSample * sample = gst_app_sink_pull_sample(GST_APP_SINK(sink_));
+    const GstClockTime timeout = frame_timeout_ms_ > 0 ?
+      static_cast<GstClockTime>(frame_timeout_ms_) * GST_MSECOND : GST_CLOCK_TIME_NONE;
+    GstSample * sample = gst_app_sink_try_pull_sample(GST_APP_SINK(sink_), timeout);
     if (!sample) {
-      RCLCPP_ERROR(get_logger(), "Could not get gstreamer sample.");
+      if (gst_app_sink_is_eos(GST_APP_SINK(sink_))) {
+        stream_ended_ = true;
+        RCLCPP_ERROR(get_logger(), "Could not get gstreamer sample (end of stream).");
+      } else {
+        RCLCPP_ERROR(
+          get_logger(), "No frame received for %d ms, restarting the stream.", frame_timeout_ms_);
+      }
       break;
     }
     GstBuffer * buf = gst_sample_get_buffer(sample);
+    // Stop on end of stream
+    if (!buf) {
+      RCLCPP_INFO(get_logger(), "Stream ended.");
+      stream_ended_ = true;
+      gst_sample_unref(sample);
+      break;
+    }
     GstMemory * memory = gst_buffer_get_memory(buf, 0);
     GstMapInfo info;
 
@@ -360,20 +392,15 @@ void GSCam::update_stream()
     }
 #endif
 
-    // Stop on end of stream
-    if (!buf) {
-      RCLCPP_INFO(get_logger(), "Stream ended.");
-      break;
-    }
-
     // RCLCPP_DEBUG(get_logger(), "Got data.");
 
     // Get the image width and height
-    GstPad * pad = gst_element_get_static_pad(sink_, "sink");
-    const GstCaps * caps = gst_pad_get_current_caps(pad);
-    GstStructure * structure = gst_caps_get_structure(caps, 0);
-    gst_structure_get_int(structure, "width", &width_);
-    gst_structure_get_int(structure, "height", &height_);
+    GstCaps * caps = gst_sample_get_caps(sample);
+    if (caps) {
+      const GstStructure * structure = gst_caps_get_structure(caps, 0);
+      gst_structure_get_int(structure, "width", &width_);
+      gst_structure_get_int(structure, "height", &height_);
+    }
 
     // Update header information
     cinfo_msg_ = camera_info_manager_.getCameraInfo();
@@ -407,8 +434,9 @@ void GSCam::update_stream()
         width_ * height_ * sensor_msgs::image_encodings::numChannels(image_encoding_);
 
       if (buf_size < expected_frame_size) {
-        RCLCPP_WARN_STREAM(
-          get_logger(), "GStreamer image buffer underflow: Expected frame to be " <<
+        RCLCPP_WARN_STREAM_THROTTLE(
+          get_logger(), *get_clock(), 5000,
+          "GStreamer image buffer underflow: Expected frame to be " <<
             expected_frame_size << " bytes but got only " <<
             buf_size << " bytes. (make sure frames are correctly encoded)");
       }
@@ -429,16 +457,16 @@ void GSCam::update_stream()
 
       std::copy(
         buf_data,
-        (buf_data) + (buf_size),
+        (buf_data) + std::min<gsize>(buf_size, expected_frame_size),
         img_msg_.data.begin());
     }
 
     // Release the buffer
-    if (buf) {
-      gst_memory_unmap(memory, &info);
-      gst_memory_unref(memory);
-      gst_sample_unref(sample);
-    }
+    gst_memory_unmap(memory, &info);
+    gst_memory_unref(memory);
+    gst_sample_unref(sample);
+
+    publish_stream();
   }
 }
 
@@ -451,7 +479,8 @@ void GSCam::publish_stream()
     // Publish the image/info
     camera_pub_.publish(img_msg_, cinfo_msg_);
   }
-  if (enable_rectifying_) {
+  // jpeg frames are never decoded, so there is no raw image to rectify
+  if (enable_rectifying_ && image_encoding_ != "jpeg") {
     sensor_msgs::msg::Image img_rect_msg;
     try {
       // Match the rectified output encoding to the source encoding so that
@@ -468,8 +497,9 @@ void GSCam::publish_stream()
 
       img_bridge_rect.toImageMsg(img_rect_msg);
       camera_pub_rect_->publish(std::move(img_rect_msg));
-    } catch (...) {
-      RCLCPP_WARN(get_logger(), "Runtime error, publish_rectified_image.");
+    } catch (const std::exception & e) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000, "Failed to publish rectified image: %s", e.what());
     }
   }
 }
@@ -487,10 +517,24 @@ void GSCam::cleanup_stream()
 
 void GSCam::run()
 {
+  const auto wait_before_retry = [this]() {
+      const auto until = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(reconnect_delay_ms_);
+      while (!stop_signal_ && rclcpp::ok() && std::chrono::steady_clock::now() < until) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
+    };
+
   while (!stop_signal_ && rclcpp::ok()) {
     if (!this->init_stream()) {
-      RCLCPP_FATAL(get_logger(), "Failed to initialize gscam stream!");
-      break;
+      // The device can be briefly busy or not yet enumerated; retry instead of
+      // shutting down the whole container.
+      RCLCPP_ERROR(
+        get_logger(), "Failed to initialize gscam stream, retrying in %d ms.",
+        reconnect_delay_ms_);
+      this->cleanup_stream();
+      wait_before_retry();
+      continue;
     }
 
     // Block while publishing
@@ -500,14 +544,20 @@ void GSCam::run()
 
     RCLCPP_INFO(get_logger(), "GStreamer stream stopped!");
 
-    if (reopen_on_eof_) {
+    if (stop_signal_ || !rclcpp::ok()) {
+      break;
+    }
+    // A stall (no frame within frame_timeout_ms) is always recovered from;
+    // a real end of stream only when reopen_on_eof is set.
+    if (reopen_on_eof_ || !stream_ended_) {
       RCLCPP_INFO(get_logger(), "Reopening stream...");
+      wait_before_retry();
     } else {
       RCLCPP_INFO(get_logger(), "Cleaning up stream and exiting...");
+      rclcpp::shutdown();
       break;
     }
   }
-  rclcpp::shutdown();
 }
 
 // Example callbacks for appsink

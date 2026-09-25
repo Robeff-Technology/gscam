@@ -167,6 +167,42 @@ int64_t GSCam::gst_to_ros_time_offset_ns()
          static_cast<int64_t>(GST_TIME_AS_NSECONDS(gst_now));
 }
 
+bool GSCam::log_bus_errors()
+{
+  if (!pipeline_) {
+    return false;
+  }
+  bool had_error = false;
+  GstBus * bus = gst_element_get_bus(pipeline_);
+  GstMessage * msg;
+  while ((msg = gst_bus_pop_filtered(
+      bus, static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_WARNING))) != NULL)
+  {
+    GError * err = NULL;
+    gchar * debug = NULL;
+    const bool is_error = GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR;
+    if (is_error) {
+      gst_message_parse_error(msg, &err, &debug);
+      had_error = true;
+    } else {
+      gst_message_parse_warning(msg, &err, &debug);
+    }
+    const std::string text = "GStreamer " + std::string(is_error ? "error" : "warning") +
+      " from " + GST_OBJECT_NAME(GST_MESSAGE_SRC(msg)) + ": " + (err ? err->message : "") +
+      " (" + (debug ? debug : "no debug info") + ")";
+    if (is_error) {
+      RCLCPP_ERROR(get_logger(), "%s", text.c_str());
+    } else {
+      RCLCPP_WARN(get_logger(), "%s", text.c_str());
+    }
+    g_clear_error(&err);
+    g_free(debug);
+    gst_message_unref(msg);
+  }
+  gst_object_unref(bus);
+  return had_error;
+}
+
 bool GSCam::init_stream()
 {
   if (!gst_is_initialized()) {
@@ -279,6 +315,7 @@ bool GSCam::init_stream()
 
   if (gst_element_get_state(pipeline_, NULL, NULL, -1) == GST_STATE_CHANGE_FAILURE) {
     RCLCPP_FATAL(get_logger(), "Failed to PAUSE stream, check your gstreamer configuration.");
+    log_bus_errors();
     return false;
   } else {
     RCLCPP_DEBUG_STREAM(get_logger(), "Stream is PAUSED.");
@@ -508,6 +545,11 @@ void GSCam::cleanup_stream()
 {
   // Clean up
   RCLCPP_INFO(get_logger(), "Stopping gstreamer pipeline...");
+  // A source that fails posts an ERROR and then pushes EOS, so an "end of
+  // stream" is only a real one when no error came with it.
+  if (log_bus_errors()) {
+    stream_ended_ = false;
+  }
   if (pipeline_) {
     gst_element_set_state(pipeline_, GST_STATE_NULL);
     gst_object_unref(pipeline_);

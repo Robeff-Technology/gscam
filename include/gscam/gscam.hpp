@@ -50,6 +50,8 @@ private:
   bool configure();
   void init_publishers();
   bool init_stream();
+  // Log pending ERROR/WARNING bus messages; returns true if any was an error
+  bool log_bus_errors();
 
   // Offset to add to a GStreamer clock timestamp to express it in ROS time.
   int64_t gst_to_ros_time_offset_ns();

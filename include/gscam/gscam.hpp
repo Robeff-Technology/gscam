@@ -15,6 +15,10 @@
 #ifndef GSCAM__GSCAM_HPP_
 #define GSCAM__GSCAM_HPP_
 
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <vector>
 #include <stdexcept>
 #include <string>
 
@@ -34,6 +38,9 @@ extern "C" {
 #include "sensor_msgs/msg/compressed_image.hpp"
 #include "sensor_msgs/msg/camera_info.hpp"
 #include "sensor_msgs/srv/set_camera_info.hpp"
+#include "std_msgs/msg/float64_multi_array.hpp"
+
+#include "gscam/frame_grid_tracker.hpp"
 
 namespace gscam
 {
@@ -52,6 +59,13 @@ private:
   void cleanup_stream();
 
   void run();
+
+  /// Snaps a raw arrival time onto the hardware frame-sync grid. Returns the
+  /// input unchanged when grid snapping is disabled.
+  rclcpp::Time snap_to_frame_grid(const rclcpp::Time & raw);
+  void report_grid_stats();
+  rcl_interfaces::msg::SetParametersResult on_set_parameters(
+    const std::vector<rclcpp::Parameter> & parameters);
 
   // General gstreamer configuration
   std::string gsconfig_;
@@ -75,6 +89,29 @@ private:
   bool use_sensor_data_qos_;
   int camera_frame_rate_;
   bool enable_rectifying_;
+
+  // Frame-sync grid snapping (see frame_grid_tracker.hpp)
+  bool grid_snap_enabled_;
+  // Tunable at runtime while calibrating, and read from the pipeline thread.
+  std::atomic<double> grid_snap_latency_;
+  bool grid_snap_diagnostics_;
+  double grid_snap_report_period_;
+  std::unique_ptr<FrameGridTracker> grid_tracker_;
+  // Arrival times are tracked relative to this epoch so that a double keeps
+  // sub-nanosecond resolution (absolute epoch nanoseconds would not).
+  int64_t grid_epoch_ns_;
+  bool grid_epoch_set_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr grid_diag_pub_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr grid_param_cb_;
+  int64_t grid_stats_since_ns_;
+  uint64_t grid_stat_count_;
+  uint64_t grid_stat_dropped_;
+  uint64_t grid_stat_outliers_;
+  uint64_t grid_stat_resets_;
+  uint64_t grid_stat_duplicates_;
+  double grid_stat_sum_;
+  double grid_stat_sum_sq_;
+  double grid_stat_max_abs_;
 
   // Camera model
   image_geometry::PinholeCameraModel pinhole_model_;

@@ -16,6 +16,7 @@ find_package(cv_bridge REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(camera_calibration_parsers REQUIRED)
 find_package(camera_info_manager REQUIRED)
 
@@ -37,6 +38,7 @@ ament_target_dependencies(gscam
   "rclcpp"
   "rclcpp_components"
   "sensor_msgs"
+  "std_msgs"
   "camera_calibration_parsers"
   "camera_info_manager")
 
@@ -59,6 +61,14 @@ if(BUILD_TESTING)
   )
   if(TARGET smoke_test)
     target_link_libraries(smoke_test gscam)
+  endif()
+
+  ament_add_gtest(
+    frame_grid_tracker_test
+    test/frame_grid_tracker_test.cpp
+  )
+  if(TARGET frame_grid_tracker_test)
+    target_include_directories(frame_grid_tracker_test PRIVATE include)
   endif()
 endif()
 

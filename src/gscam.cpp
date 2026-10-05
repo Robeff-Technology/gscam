@@ -16,7 +16,10 @@
 #include <unistd.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <algorithm>
+#include <cmath>
 #include <iostream>
+#include <memory>
 #include <string>
 
 extern "C" {
@@ -33,6 +36,7 @@ extern "C" {
 #include "sensor_msgs/msg/compressed_image.hpp"
 #include "sensor_msgs/msg/camera_info.hpp"
 #include "sensor_msgs/image_encodings.hpp"
+#include "std_msgs/msg/float64_multi_array.hpp"
 
 #include "gscam/gscam.hpp"
 
@@ -45,6 +49,18 @@ GSCam::GSCam(const rclcpp::NodeOptions & options)
   pipeline_(NULL),
   sink_(NULL),
   camera_info_manager_(this),
+  grid_snap_latency_(0.0),
+  grid_epoch_ns_(0),
+  grid_epoch_set_(false),
+  grid_stats_since_ns_(0),
+  grid_stat_count_(0),
+  grid_stat_dropped_(0),
+  grid_stat_outliers_(0),
+  grid_stat_resets_(0),
+  grid_stat_duplicates_(0),
+  grid_stat_sum_(0.0),
+  grid_stat_sum_sq_(0.0),
+  grid_stat_max_abs_(0.0),
   stop_signal_(false)
 {
   if (!configure()) {
@@ -147,7 +163,158 @@ bool GSCam::configure()
   camera_frame_rate_ = declare_parameter("camera_frame_rate", 15);
   enable_rectifying_ = declare_parameter("enable_rectifying", true);
 
+  // Frame-sync grid snapping. The NPL54 drives every camera from one hardware
+  // frame-sync generator, so true capture instants lie on a uniform grid; this
+  // recovers that grid and replaces the jittery host arrival time with it.
+  grid_snap_enabled_ = declare_parameter("grid_snap", false);
+  grid_snap_latency_ = declare_parameter("grid_snap_latency", 0.0);
+  grid_param_cb_ = add_on_set_parameters_callback(
+    std::bind(&GSCam::on_set_parameters, this, std::placeholders::_1));
+  grid_snap_diagnostics_ = declare_parameter("grid_snap_diagnostics", true);
+  grid_snap_report_period_ = declare_parameter("grid_snap_report_period", 10.0);
+
+  FrameGridTracker::Options grid_opt;
+  const double grid_fps = declare_parameter("grid_snap_fps", 0.0);
+  grid_opt.fps = grid_fps > 0.0 ? grid_fps : static_cast<double>(camera_frame_rate_);
+  grid_opt.phase_gain = declare_parameter("grid_snap_phase_gain", 0.05);
+  grid_opt.period_gain = declare_parameter("grid_snap_period_gain", 5e-4);
+  grid_opt.reset_threshold = declare_parameter("grid_snap_reset_threshold", 0.35);
+  grid_opt.max_gap = declare_parameter("grid_snap_max_gap", 2.0);
+
+  if (grid_opt.fps <= 0.0) {
+    RCLCPP_FATAL(get_logger(), "grid_snap needs a positive frame rate.");
+    return false;
+  }
+
+  grid_tracker_ = std::make_unique<FrameGridTracker>(grid_opt);
+
+  if (grid_snap_enabled_) {
+    RCLCPP_INFO(
+      get_logger(),
+      "Frame-sync grid snapping enabled: %.3f fps grid, %.1f ms latency offset.",
+      grid_opt.fps, grid_snap_latency_.load() * 1e3);
+
+    if (grid_snap_diagnostics_) {
+      // [residual_s, step, measured_fps, flags] with flags bit0=outlier,
+      // bit1=reset. Record this topic to histogram the residuals offline.
+      grid_diag_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
+        "~/grid_diagnostics", rclcpp::SensorDataQoS());
+    }
+  }
+
   return true;
+}
+
+rclcpp::Time GSCam::snap_to_frame_grid(const rclcpp::Time & raw)
+{
+  if (!grid_snap_enabled_ || !grid_tracker_) {
+    return raw;
+  }
+
+  const int64_t raw_ns = raw.nanoseconds();
+  if (!grid_epoch_set_) {
+    // Anchor on whole seconds so the relative value stays small and exact.
+    grid_epoch_ns_ = (raw_ns / 1000000000LL) * 1000000000LL;
+    grid_epoch_set_ = true;
+    grid_stats_since_ns_ = raw_ns;
+  }
+
+  const auto result = grid_tracker_->update(static_cast<double>(raw_ns - grid_epoch_ns_) * 1e-9);
+
+  ++grid_stat_count_;
+  if (result.reset) {
+    ++grid_stat_resets_;
+  } else if (result.step == 0) {
+    ++grid_stat_duplicates_;
+  } else {
+    if (result.outlier) {
+      ++grid_stat_outliers_;
+    }
+    grid_stat_dropped_ += static_cast<uint64_t>(result.step - 1);
+    grid_stat_sum_ += result.residual;
+    grid_stat_sum_sq_ += result.residual * result.residual;
+    grid_stat_max_abs_ = std::max(grid_stat_max_abs_, std::fabs(result.residual));
+  }
+
+  if (grid_diag_pub_) {
+    std_msgs::msg::Float64MultiArray diag;
+    diag.data = {
+      result.residual,
+      static_cast<double>(result.step),
+      grid_tracker_->measured_fps(),
+      static_cast<double>((result.outlier ? 1 : 0) | (result.reset ? 2 : 0))};
+    grid_diag_pub_->publish(diag);
+  }
+
+  if (grid_snap_report_period_ > 0.0 &&
+    raw_ns - grid_stats_since_ns_ >= static_cast<int64_t>(grid_snap_report_period_ * 1e9))
+  {
+    report_grid_stats();
+    grid_stats_since_ns_ = raw_ns;
+  }
+
+  // The tracked grid sits `grid_snap_latency_` after the true start of frame;
+  // that offset is constant across all cameras and is calibrated separately.
+  const int64_t snapped_ns = grid_epoch_ns_ +
+    static_cast<int64_t>(std::llround((result.stamp - grid_snap_latency_.load()) * 1e9));
+  return rclcpp::Time(snapped_ns, raw.get_clock_type());
+}
+
+rcl_interfaces::msg::SetParametersResult GSCam::on_set_parameters(
+  const std::vector<rclcpp::Parameter> & parameters)
+{
+  rcl_interfaces::msg::SetParametersResult result;
+  result.successful = true;
+
+  for (const auto & parameter : parameters) {
+    // Only the latency offset is live-tunable: it is a pure output shift, so
+    // changing it cannot disturb the tracking loop. Everything else would need
+    // the loop to re-lock and is read once at startup.
+    if (parameter.get_name() == "grid_snap_latency") {
+      if (parameter.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE) {
+        result.successful = false;
+        result.reason = "grid_snap_latency must be a double (seconds)";
+        break;
+      }
+      grid_snap_latency_ = parameter.as_double();
+      RCLCPP_INFO(
+        get_logger(), "grid_snap_latency set to %.3f ms",
+        grid_snap_latency_.load() * 1e3);
+    }
+  }
+
+  return result;
+}
+
+void GSCam::report_grid_stats()
+{
+  const uint64_t n = grid_stat_count_ - grid_stat_resets_ - grid_stat_duplicates_;
+  if (n == 0) {
+    return;
+  }
+
+  const double mean = grid_stat_sum_ / static_cast<double>(n);
+  const double var = std::max(0.0, grid_stat_sum_sq_ / static_cast<double>(n) - mean * mean);
+
+  RCLCPP_INFO(
+    get_logger(),
+    "grid_snap: %lu frames, residual mean %.3f ms / sd %.3f ms / max %.3f ms, "
+    "fps %.6f (%+.1f ppm), dropped %lu, outliers %lu, duplicates %lu, resets %lu",
+    static_cast<unsigned long>(n), mean * 1e3, std::sqrt(var) * 1e3,
+    grid_stat_max_abs_ * 1e3, grid_tracker_->measured_fps(), grid_tracker_->ppm(),
+    static_cast<unsigned long>(grid_stat_dropped_),
+    static_cast<unsigned long>(grid_stat_outliers_),
+    static_cast<unsigned long>(grid_stat_duplicates_),
+    static_cast<unsigned long>(grid_stat_resets_));
+
+  grid_stat_count_ = 0;
+  grid_stat_dropped_ = 0;
+  grid_stat_outliers_ = 0;
+  grid_stat_resets_ = 0;
+  grid_stat_duplicates_ = 0;
+  grid_stat_sum_ = 0.0;
+  grid_stat_sum_sq_ = 0.0;
+  grid_stat_max_abs_ = 0.0;
 }
 
 bool GSCam::init_stream()
@@ -369,11 +536,10 @@ void GSCam::update_stream()
     // Update header information
     cinfo_msg_ = camera_info_manager_.getCameraInfo();
 
-    if (use_gst_timestamps_) {
-      cinfo_msg_.header.stamp = rclcpp::Time(GST_TIME_AS_NSECONDS(buf->pts + bt) + time_offset_);
-    } else {
-      cinfo_msg_.header.stamp = now();
-    }
+    const rclcpp::Time raw_stamp = use_gst_timestamps_ ?
+      rclcpp::Time(GST_TIME_AS_NSECONDS(buf->pts + bt) + time_offset_, now().get_clock_type()) :
+      now();
+    cinfo_msg_.header.stamp = snap_to_frame_grid(raw_stamp);
     // RCLCPP_INFO(get_logger(), "Image time stamp: %.3f",cinfo->header.stamp.toSec());
     cinfo_msg_.header.frame_id = frame_id_;
     if (image_encoding_ == "jpeg") {
@@ -458,6 +624,12 @@ void GSCam::publish_stream()
 
 void GSCam::cleanup_stream()
 {
+  // The grid phase is meaningless across a pipeline restart.
+  if (grid_tracker_) {
+    grid_tracker_->reset();
+    grid_epoch_set_ = false;
+  }
+
   // Clean up
   RCLCPP_INFO(get_logger(), "Stopping gstreamer pipeline...");
   if (pipeline_) {

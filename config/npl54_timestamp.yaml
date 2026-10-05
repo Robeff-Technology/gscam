@@ -1,0 +1,48 @@
+# Frame-sync grid snapping for the PCIe-NPL54.
+#
+# The card drives all four cameras from one MCU frame-sync generator, so the
+# true start-of-frame instants lie on a uniform grid. What arrives at the host
+# is that grid plus a pipeline latency plus scheduling jitter. Snapping each
+# arrival back onto the recovered grid removes the jitter; `grid_snap_latency`
+# removes the bias.
+#
+# Apply to every gscam node:
+#   ros2 run gscam gscam_node --ros-args --params-file <this file> ...
+
+/**:
+  ros__parameters:
+    grid_snap: true
+
+    # Nominal frame rate of the grid. 0 falls back to `camera_frame_rate`.
+    grid_snap_fps: 30.0
+
+    # Seconds subtracted from every snapped timestamp: the whole sensor-to-ROS
+    # latency (exposure, readout, ISP, GMSL2, FPGA, DMA, v4l2loopback,
+    # GStreamer). It is normally LARGER than one frame period, so a value of
+    # e.g. 0.233 at 30 fps shifts timestamps back by seven grid steps.
+    #
+    # Measure it once, then keep it fixed. Getting it wrong by one frame period
+    # biases every timestamp by 33 ms. Tunable at runtime while calibrating:
+    #   ros2 param set /<node> grid_snap_latency 0.233
+    grid_snap_latency: 0.0
+
+    # Tracking loop. Raise phase_gain to follow the grid faster, lower it to
+    # filter jitter harder. period_gain tracks the card's oscillator when it is
+    # free-running instead of locked to PPS; 0.0 pins the rate at nominal.
+    grid_snap_phase_gain: 0.05
+    grid_snap_period_gain: 0.0005
+
+    # Residuals beyond this fraction of the grid spacing are treated as
+    # outliers and do not move the loop (0.35 = 11.7 ms at 30 fps).
+    grid_snap_reset_threshold: 0.35
+
+    # Gap after which the loop gives up and re-anchors, in seconds.
+    grid_snap_max_gap: 2.0
+
+    # Per-frame [residual_s, step, measured_fps, flags] on ~/grid_diagnostics,
+    # where flags bit0 = outlier and bit1 = reset. Record it to histogram the
+    # residuals, which is how you check the jitter is small enough to snap.
+    grid_snap_diagnostics: true
+
+    # Seconds between the aggregate log lines. 0 disables them.
+    grid_snap_report_period: 10.0

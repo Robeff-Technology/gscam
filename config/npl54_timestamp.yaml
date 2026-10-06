@@ -13,16 +13,49 @@
   ros__parameters:
     grid_snap: true
 
+    # "track": recover the grid from arrival times (card free-running).
+    # "pps":   t = T_pps + grid_snap_pps_phase + n / fps. Use this when the
+    #          card is in "PPS input and frame-sync" mode and the host clock is
+    #          PTP-synced to the same grandmaster that drives the PPS. Nothing
+    #          is estimated; the arrival time only picks the slot n.
+    #          grid_snap_latency and the tracking-loop gains are unused.
+    grid_snap_mode: track
+
+    # pps mode only: seconds from the PPS edge to the instant the stamp should
+    # represent for frame 0. Includes the card's per-port frame-sync phase
+    # shift, if any, plus the trigger-to-exposure delay (exposure, and the
+    # point in it you want stamped). Set per camera if the ports are shifted.
+    grid_snap_pps_phase: 0.0
+
+    # pps mode only: the expected arrival delay after the grid slot is
+    #   grid_snap_pps_arrival_phase + grid_snap_pps_frame_delay / fps.
+    #
+    # arrival_phase is where in the frame period frames reach the host, in
+    # [0, 1/fps). It only has to be right to within half a period, and the log
+    # prints "measured arrival phase" every report period: on a new setup run
+    # once with 0.0, then copy that value here.
+    #
+    # frame_delay is how many whole frames the pipeline adds on top. The phase
+    # measurement cannot see it, so it must come from an external reference
+    # (an LED driven by the PPS, or LiDAR-camera time alignment). Each step
+    # shifts every timestamp by one frame period.
+    #
+    # Both are tunable at runtime:
+    #   ros2 param set /<node> grid_snap_pps_frame_delay 2
+    grid_snap_pps_arrival_phase: 0.0
+    grid_snap_pps_frame_delay: 0
+
     # Nominal frame rate of the grid. 0 falls back to `camera_frame_rate`.
     grid_snap_fps: 30.0
 
-    # Seconds subtracted from every snapped timestamp: the whole sensor-to-ROS
-    # latency (exposure, readout, ISP, GMSL2, FPGA, DMA, v4l2loopback,
-    # GStreamer). It is normally LARGER than one frame period, so a value of
-    # e.g. 0.233 at 30 fps shifts timestamps back by seven grid steps.
+    # The whole sensor-to-ROS latency (exposure, readout, ISP, GMSL2, FPGA,
+    # DMA, v4l2loopback, GStreamer). It is normally LARGER than one frame
+    # period, e.g. 0.233 s at 30 fps is seven grid steps.
     #
-    # Measure it once, then keep it fixed. Getting it wrong by one frame period
-    # biases every timestamp by 33 ms. Tunable at runtime while calibrating:
+    # track mode only: subtracted from every snapped timestamp. Getting it
+    # wrong by one frame period biases every timestamp by 33 ms.
+    #
+    # Measure it once, then keep it fixed. Tunable at runtime while calibrating:
     #   ros2 param set /<node> grid_snap_latency 0.233
     grid_snap_latency: 0.0
 

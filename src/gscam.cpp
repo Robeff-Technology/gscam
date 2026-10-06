@@ -17,6 +17,7 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <algorithm>
+#include <cinttypes>
 #include <cmath>
 #include <iostream>
 #include <memory>
@@ -50,6 +51,10 @@ GSCam::GSCam(const rclcpp::NodeOptions & options)
   sink_(NULL),
   camera_info_manager_(this),
   grid_snap_latency_(0.0),
+  grid_snap_pps_(false),
+  pps_arrival_phase_(0.0),
+  pps_frame_delay_(0),
+  pps_period_(0.0),
   grid_epoch_ns_(0),
   grid_epoch_set_(false),
   grid_stats_since_ns_(0),
@@ -60,6 +65,8 @@ GSCam::GSCam(const rclcpp::NodeOptions & options)
   grid_stat_duplicates_(0),
   grid_stat_sum_(0.0),
   grid_stat_sum_sq_(0.0),
+  grid_stat_sin_(0.0),
+  grid_stat_cos_(0.0),
   grid_stat_max_abs_(0.0),
   stop_signal_(false)
 {
@@ -67,8 +74,6 @@ GSCam::GSCam(const rclcpp::NodeOptions & options)
     RCLCPP_FATAL(get_logger(), "Failed to configure gscam!");
     return;
   }
-  int period_ms = 1000 / camera_frame_rate_;
-  timer_ = this->create_wall_timer(std::chrono::milliseconds(period_ms), std::bind(&GSCam::publish_stream, this));
   pipeline_thread_ = std::thread(
     [this]()
     {
@@ -188,11 +193,44 @@ bool GSCam::configure()
 
   grid_tracker_ = std::make_unique<FrameGridTracker>(grid_opt);
 
+  // "track" recovers the grid from arrival times; "pps" computes it as
+  // T_pps + phase + n / fps, valid when the card's frame sync is PPS-locked.
+  const std::string grid_mode = declare_parameter("grid_snap_mode", std::string("track"));
+  const double pps_phase = declare_parameter("grid_snap_pps_phase", 0.0);
+  pps_arrival_phase_ = declare_parameter("grid_snap_pps_arrival_phase", 0.0);
+  pps_frame_delay_ = static_cast<int>(declare_parameter("grid_snap_pps_frame_delay", 0));
+  if (grid_mode == "pps") {
+    grid_snap_pps_ = true;
+    const int pps_fps = static_cast<int>(std::lround(grid_opt.fps));
+    if (std::fabs(grid_opt.fps - pps_fps) > 1e-6) {
+      RCLCPP_FATAL(
+        get_logger(), "grid_snap_mode pps needs a whole number of frames per second, got %.6f.",
+        grid_opt.fps);
+      return false;
+    }
+    pps_grid_ = std::make_unique<PpsFrameGrid>(
+      pps_fps, static_cast<int64_t>(std::llround(pps_phase * 1e9)));
+    pps_period_ = 1.0 / pps_fps;
+  } else if (grid_mode != "track") {
+    RCLCPP_FATAL(
+      get_logger(), "Unknown grid_snap_mode '%s', expected 'track' or 'pps'.", grid_mode.c_str());
+    return false;
+  }
+
   if (grid_snap_enabled_) {
-    RCLCPP_INFO(
-      get_logger(),
-      "Frame-sync grid snapping enabled: %.3f fps grid, %.1f ms latency offset.",
-      grid_opt.fps, grid_snap_latency_.load() * 1e3);
+    if (grid_snap_pps_) {
+      RCLCPP_INFO(
+        get_logger(),
+        "PPS frame grid enabled: t = T_pps + %.3f ms + n / %.0f, arrival latency "
+        "%.3f ms phase + %d frames = %.3f ms.",
+        pps_phase * 1e3, grid_opt.fps, pps_arrival_phase_.load() * 1e3,
+        pps_frame_delay_.load(), pps_latency() * 1e3);
+    } else {
+      RCLCPP_INFO(
+        get_logger(),
+        "Frame-sync grid snapping enabled: %.3f fps grid, %.1f ms latency offset.",
+        grid_opt.fps, grid_snap_latency_.load() * 1e3);
+    }
 
     if (grid_snap_diagnostics_) {
       // [residual_s, step, measured_fps, flags] with flags bit0=outlier,
@@ -212,6 +250,9 @@ rclcpp::Time GSCam::snap_to_frame_grid(const rclcpp::Time & raw)
   }
 
   const int64_t raw_ns = raw.nanoseconds();
+  if (grid_snap_pps_) {
+    return snap_to_pps_grid(raw);
+  }
   if (!grid_epoch_set_) {
     // Anchor on whole seconds so the relative value stays small and exact.
     grid_epoch_ns_ = (raw_ns / 1000000000LL) * 1000000000LL;
@@ -260,6 +301,56 @@ rclcpp::Time GSCam::snap_to_frame_grid(const rclcpp::Time & raw)
   return rclcpp::Time(snapped_ns, raw.get_clock_type());
 }
 
+rclcpp::Time GSCam::snap_to_pps_grid(const rclcpp::Time & raw)
+{
+  const int64_t raw_ns = raw.nanoseconds();
+  if (grid_stats_since_ns_ == 0) {
+    grid_stats_since_ns_ = raw_ns;
+  }
+
+  const auto result = pps_grid_->update(
+    raw_ns, static_cast<int64_t>(std::llround(pps_latency() * 1e9)));
+
+  ++grid_stat_count_;
+  if (result.step <= 0) {
+    ++grid_stat_duplicates_;
+  } else {
+    grid_stat_dropped_ += static_cast<uint64_t>(result.step - 1);
+    grid_stat_sum_ += result.residual;
+    grid_stat_sum_sq_ += result.residual * result.residual;
+    grid_stat_max_abs_ = std::max(grid_stat_max_abs_, std::fabs(result.residual));
+    const double angle = 2.0 * M_PI * result.residual / pps_period_;
+    grid_stat_sin_ += std::sin(angle);
+    grid_stat_cos_ += std::cos(angle);
+  }
+
+  if (grid_diag_pub_) {
+    // Same layout as track mode; the third field is the frame index within
+    // the second instead of a measured rate.
+    std_msgs::msg::Float64MultiArray diag;
+    diag.data = {
+      result.residual,
+      static_cast<double>(result.step),
+      static_cast<double>(result.index),
+      0.0};
+    grid_diag_pub_->publish(diag);
+  }
+
+  if (grid_snap_report_period_ > 0.0 &&
+    raw_ns - grid_stats_since_ns_ >= static_cast<int64_t>(grid_snap_report_period_ * 1e9))
+  {
+    report_grid_stats();
+    grid_stats_since_ns_ = raw_ns;
+  }
+
+  return rclcpp::Time(result.stamp_ns, raw.get_clock_type());
+}
+
+double GSCam::pps_latency() const
+{
+  return pps_arrival_phase_.load() + pps_frame_delay_.load() * pps_period_;
+}
+
 rcl_interfaces::msg::SetParametersResult GSCam::on_set_parameters(
   const std::vector<rclcpp::Parameter> & parameters)
 {
@@ -280,6 +371,27 @@ rcl_interfaces::msg::SetParametersResult GSCam::on_set_parameters(
       RCLCPP_INFO(
         get_logger(), "grid_snap_latency set to %.3f ms",
         grid_snap_latency_.load() * 1e3);
+    } else if (parameter.get_name() == "grid_snap_pps_arrival_phase") {
+      // Like the latency, both pps latency terms only choose which slot a
+      // frame lands in, so they can change without disturbing anything.
+      if (parameter.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE) {
+        result.successful = false;
+        result.reason = "grid_snap_pps_arrival_phase must be a double (seconds)";
+        break;
+      }
+      pps_arrival_phase_ = parameter.as_double();
+      RCLCPP_INFO(
+        get_logger(), "grid_snap_pps_arrival_phase set to %.3f ms",
+        pps_arrival_phase_.load() * 1e3);
+    } else if (parameter.get_name() == "grid_snap_pps_frame_delay") {
+      if (parameter.get_type() != rclcpp::ParameterType::PARAMETER_INTEGER) {
+        result.successful = false;
+        result.reason = "grid_snap_pps_frame_delay must be an integer (frames)";
+        break;
+      }
+      pps_frame_delay_ = static_cast<int>(parameter.as_int());
+      RCLCPP_INFO(
+        get_logger(), "grid_snap_pps_frame_delay set to %d frames", pps_frame_delay_.load());
     }
   }
 
@@ -296,16 +408,34 @@ void GSCam::report_grid_stats()
   const double mean = grid_stat_sum_ / static_cast<double>(n);
   const double var = std::max(0.0, grid_stat_sum_sq_ / static_cast<double>(n) - mean * mean);
 
-  RCLCPP_INFO(
-    get_logger(),
-    "grid_snap: %lu frames, residual mean %.3f ms / sd %.3f ms / max %.3f ms, "
-    "fps %.6f (%+.1f ppm), dropped %lu, outliers %lu, duplicates %lu, resets %lu",
-    static_cast<unsigned long>(n), mean * 1e3, std::sqrt(var) * 1e3,
-    grid_stat_max_abs_ * 1e3, grid_tracker_->measured_fps(), grid_tracker_->ppm(),
-    static_cast<unsigned long>(grid_stat_dropped_),
-    static_cast<unsigned long>(grid_stat_outliers_),
-    static_cast<unsigned long>(grid_stat_duplicates_),
-    static_cast<unsigned long>(grid_stat_resets_));
+  if (grid_snap_pps_) {
+    // The circular mean residual is the error in the configured arrival phase,
+    // so configured + mean is the phase this setup actually shows. Residuals
+    // approaching half a frame period risk assigning frames to the wrong slot.
+    const double circ_mean = std::atan2(grid_stat_sin_, grid_stat_cos_) * pps_period_ /
+      (2.0 * M_PI);
+    double measured_phase = std::fmod(pps_arrival_phase_.load() + circ_mean, pps_period_);
+    if (measured_phase < 0.0) {
+      measured_phase += pps_period_;
+    }
+    RCLCPP_INFO(
+      get_logger(),
+      "pps grid: %" PRIu64 " frames, residual mean %.3f ms / sd %.3f ms / max %.3f ms, "
+      "dropped %" PRIu64 ", duplicates %" PRIu64 ", measured arrival phase %.3f ms",
+      n, mean * 1e3, std::sqrt(var) * 1e3, grid_stat_max_abs_ * 1e3,
+      grid_stat_dropped_, grid_stat_duplicates_, measured_phase * 1e3);
+  } else {
+    RCLCPP_INFO(
+      get_logger(),
+      "grid_snap: %lu frames, residual mean %.3f ms / sd %.3f ms / max %.3f ms, "
+      "fps %.6f (%+.1f ppm), dropped %lu, outliers %lu, duplicates %lu, resets %lu",
+      static_cast<unsigned long>(n), mean * 1e3, std::sqrt(var) * 1e3,
+      grid_stat_max_abs_ * 1e3, grid_tracker_->measured_fps(), grid_tracker_->ppm(),
+      static_cast<unsigned long>(grid_stat_dropped_),
+      static_cast<unsigned long>(grid_stat_outliers_),
+      static_cast<unsigned long>(grid_stat_duplicates_),
+      static_cast<unsigned long>(grid_stat_resets_));
+  }
 
   grid_stat_count_ = 0;
   grid_stat_dropped_ = 0;
@@ -314,6 +444,8 @@ void GSCam::report_grid_stats()
   grid_stat_duplicates_ = 0;
   grid_stat_sum_ = 0.0;
   grid_stat_sum_sq_ = 0.0;
+  grid_stat_sin_ = 0.0;
+  grid_stat_cos_ = 0.0;
   grid_stat_max_abs_ = 0.0;
 }
 
@@ -587,6 +719,11 @@ void GSCam::update_stream()
       gst_memory_unref(memory);
       gst_sample_unref(sample);
     }
+
+    // Publish every frame exactly once, as it arrives. Publishing from a timer
+    // instead duplicated or dropped frames whenever its rate did not match
+    // the camera, and raced with this thread on the message buffers.
+    publish_stream();
   }
 }
 
@@ -628,6 +765,9 @@ void GSCam::cleanup_stream()
   if (grid_tracker_) {
     grid_tracker_->reset();
     grid_epoch_set_ = false;
+  }
+  if (pps_grid_) {
+    pps_grid_->reset();
   }
 
   // Clean up

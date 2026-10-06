@@ -41,6 +41,7 @@ extern "C" {
 #include "std_msgs/msg/float64_multi_array.hpp"
 
 #include "gscam/frame_grid_tracker.hpp"
+#include "gscam/pps_frame_grid.hpp"
 
 namespace gscam
 {
@@ -63,6 +64,10 @@ private:
   /// Snaps a raw arrival time onto the hardware frame-sync grid. Returns the
   /// input unchanged when grid snapping is disabled.
   rclcpp::Time snap_to_frame_grid(const rclcpp::Time & raw);
+  /// Places a raw arrival time at T_pps + phase + n / fps.
+  rclcpp::Time snap_to_pps_grid(const rclcpp::Time & raw);
+  /// Expected arrival delay after the PPS grid slot, in seconds.
+  double pps_latency() const;
   void report_grid_stats();
   rcl_interfaces::msg::SetParametersResult on_set_parameters(
     const std::vector<rclcpp::Parameter> & parameters);
@@ -97,6 +102,16 @@ private:
   bool grid_snap_diagnostics_;
   double grid_snap_report_period_;
   std::unique_ptr<FrameGridTracker> grid_tracker_;
+  // grid_snap_mode "pps": frames are placed at T_pps + phase + n / fps instead
+  // of on a grid tracked from arrival times (see pps_frame_grid.hpp).
+  bool grid_snap_pps_;
+  std::unique_ptr<PpsFrameGrid> pps_grid_;
+  // pps mode arrival latency = arrival_phase + frame_delay / fps. The phase is
+  // measured (and logged) per setup; frame_delay is the whole frames the
+  // phase measurement cannot see. Both are tunable at runtime.
+  std::atomic<double> pps_arrival_phase_;
+  std::atomic<int> pps_frame_delay_;
+  double pps_period_;
   // Arrival times are tracked relative to this epoch so that a double keeps
   // sub-nanosecond resolution (absolute epoch nanoseconds would not).
   int64_t grid_epoch_ns_;
@@ -111,6 +126,10 @@ private:
   uint64_t grid_stat_duplicates_;
   double grid_stat_sum_;
   double grid_stat_sum_sq_;
+  // Circular sums of the pps residual, so the measured arrival phase stays
+  // meaningful when the configured one is off by up to half a period.
+  double grid_stat_sin_;
+  double grid_stat_cos_;
   double grid_stat_max_abs_;
 
   // Camera model
@@ -121,9 +140,6 @@ private:
   uint64_t time_offset_;
   camera_info_manager::CameraInfoManager camera_info_manager_;
   image_transport::CameraPublisher camera_pub_;
-
-  // ROS Timer
-  rclcpp::TimerBase::SharedPtr timer_;
 
   // Camera message
   sensor_msgs::msg::Image img_msg_;

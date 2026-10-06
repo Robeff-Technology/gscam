@@ -1,18 +1,21 @@
-# camera51
+# IMX390 H120 -- checkerboard calibration, fisheye (equidistant)
+#   cv2.fisheye.calibrate on the camera_calibration samples, flags
+#   RECOMPUTE_EXTRINSIC | FIX_SKEW; 7x7 board, 0.069 m squares
+#   13 of 16 views (2 bent-board views dropped, 1 not detected), rms 0.67 px
 image_width: 1920
-image_height: 1536
+image_height: 1080
 camera_name: camera0
 camera_matrix:
   rows: 3
   cols: 3
-  data: [1995.46433,    0.     ,  915.45021,
-            0.     , 1997.36795,  794.05839,
-            0.     ,    0.     ,    1.     ]
-distortion_model: plumb_bob
+  data: [956.148954,   0.      , 934.233438,
+           0.      , 951.865914, 532.290926,
+           0.      ,   0.      ,   1.      ]
+distortion_model: equidistant
 distortion_coefficients:
   rows: 1
-  cols: 5
-  data: [-0.562008, 0.303193, -0.003601, 0.001459, 0.000000]
+  cols: 4
+  data: [-0.063856, 0.024364, -0.016550, 0.003034]
 rectification_matrix:
   rows: 3
   cols: 3
@@ -22,6 +25,6 @@ rectification_matrix:
 projection_matrix:
   rows: 3
   cols: 4
-  data: [1995.46433,    0.     ,  915.45021,    0.     ,
-            0.     , 1997.36795,  794.05839,    0.     ,
-            0.     ,    0.     ,    1.     ,    0.     ]  
+  data: [956.148954,   0.      , 934.233438, 0.,
+           0.      , 951.865914, 532.290926, 0.,
+           0.      ,   0.      ,   1.      , 0.]

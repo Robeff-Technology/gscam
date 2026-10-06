@@ -70,6 +70,14 @@ if(BUILD_TESTING)
   if(TARGET frame_grid_tracker_test)
     target_include_directories(frame_grid_tracker_test PRIVATE include)
   endif()
+
+  ament_add_gtest(
+    pps_frame_grid_test
+    test/pps_frame_grid_test.cpp
+  )
+  if(TARGET pps_frame_grid_test)
+    target_include_directories(pps_frame_grid_test PRIVATE include)
+  endif()
 endif()
 
 ament_export_dependencies(class_loader)

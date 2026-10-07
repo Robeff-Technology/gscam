@@ -21,6 +21,7 @@
 #include <vector>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 extern "C" {
 #include "gst/gst.h"
@@ -54,7 +55,14 @@ public:
 
 private:
   bool configure();
+  void init_publishers();
   bool init_stream();
+  // Log pending ERROR/WARNING bus messages; returns true if any was an error
+  bool log_bus_errors();
+
+  // Offset to add to a GStreamer clock timestamp to express it in ROS time.
+  int64_t gst_to_ros_time_offset_ns();
+
   void update_stream();
   void publish_stream();
   void cleanup_stream();
@@ -94,6 +102,12 @@ private:
   bool use_sensor_data_qos_;
   int camera_frame_rate_;
   bool enable_rectifying_;
+  // Restart the pipeline when no frame arrives within this time (0 disables)
+  int frame_timeout_ms_;
+  // Delay before retrying a pipeline that failed to start or stalled
+  int reconnect_delay_ms_;
+  // Set by update_stream() when the stream reached EOS rather than stalling
+  bool stream_ended_ = false;
 
   // Frame-sync grid snapping (see frame_grid_tracker.hpp)
   bool grid_snap_enabled_;
